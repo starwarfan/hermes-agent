@@ -13,7 +13,6 @@ Tests cover:
 """
 
 import json
-import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -116,6 +115,7 @@ class TestAdapterInit:
         assert adapter._host == "127.0.0.1"
         assert adapter._port == 8642
         assert adapter._api_key == ""
+        assert adapter._passthrough_enabled is False
         assert adapter.platform == Platform.API_SERVER
 
     def test_custom_config_from_extra(self):
@@ -126,6 +126,7 @@ class TestAdapterInit:
                 "port": 9999,
                 "key": "sk-test",
                 "cors_origins": ["http://localhost:3000"],
+                "passthrough_enabled": True,
             },
         )
         adapter = APIServerAdapter(config)
@@ -133,12 +134,14 @@ class TestAdapterInit:
         assert adapter._port == 9999
         assert adapter._api_key == "sk-test"
         assert adapter._cors_origins == ("http://localhost:3000",)
+        assert adapter._passthrough_enabled is True
 
     def test_config_from_env(self, monkeypatch):
         monkeypatch.setenv("API_SERVER_HOST", "10.0.0.1")
         monkeypatch.setenv("API_SERVER_PORT", "7777")
         monkeypatch.setenv("API_SERVER_KEY", "sk-env")
         monkeypatch.setenv("API_SERVER_CORS_ORIGINS", "http://localhost:3000, http://127.0.0.1:3000")
+        monkeypatch.setenv("API_SERVER_PASSTHROUGH_ENABLED", "true")
         config = PlatformConfig(enabled=True)
         adapter = APIServerAdapter(config)
         assert adapter._host == "10.0.0.1"
@@ -148,6 +151,7 @@ class TestAdapterInit:
             "http://localhost:3000",
             "http://127.0.0.1:3000",
         )
+        assert adapter._passthrough_enabled is True
 
 
 # ---------------------------------------------------------------------------
@@ -203,13 +207,19 @@ class TestAuth:
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
+def _make_adapter(
+    api_key: str = "",
+    cors_origins=None,
+    passthrough_enabled: bool = False,
+) -> APIServerAdapter:
     """Create an adapter with optional API key."""
     extra = {}
     if api_key:
         extra["key"] = api_key
     if cors_origins is not None:
         extra["cors_origins"] = cors_origins
+    if passthrough_enabled:
+        extra["passthrough_enabled"] = True
     config = PlatformConfig(enabled=True, extra=extra)
     return APIServerAdapter(config)
 
@@ -1063,6 +1073,202 @@ class TestResponsesEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# Passthrough mode
+# ---------------------------------------------------------------------------
+
+
+class TestPassthroughMode:
+    @staticmethod
+    def _runtime(
+        *,
+        api_mode: str = "chat_completions",
+        provider: str = "openrouter",
+        model: str = "upstream-model",
+        api_key: str = "upstream-secret",
+    ) -> dict:
+        return {
+            "provider": provider,
+            "api_mode": api_mode,
+            "api_key": api_key,
+            "model": model,
+        }
+
+    @pytest.mark.asyncio
+    async def test_chat_passthrough_non_stream_uses_provider_client(self):
+        adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
+        app = _create_app(adapter)
+        runtime = self._runtime()
+        passthrough_result = {
+            "final_response": "from provider-client",
+            "finish_reason": "stop",
+            "model": "upstream-model",
+        }
+        usage = {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7}
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_resolve_passthrough_runtime", return_value=runtime),
+                patch.object(
+                    adapter,
+                    "_provider_client_call_chat",
+                    new=AsyncMock(return_value=(passthrough_result, usage)),
+                ) as mock_provider_call,
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sk-local"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["model"] == "upstream-model"
+                assert data["choices"][0]["message"]["content"] == "from provider-client"
+                assert data["usage"]["prompt_tokens"] == 4
+                assert data["usage"]["completion_tokens"] == 3
+                assert data["usage"]["total_tokens"] == 7
+                assert mock_provider_call.await_count == 1
+                assert mock_provider_call.await_args.kwargs["stream"] is False
+                mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_chat_passthrough_stream_uses_provider_client(self):
+        adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
+        app = _create_app(adapter)
+        runtime = self._runtime()
+
+        async def _fake_provider_call(**kwargs):
+            callback = kwargs.get("stream_delta_callback")
+            if callback:
+                callback("hello")
+                callback(" world")
+            return (
+                {
+                    "final_response": "hello world",
+                    "finish_reason": "stop",
+                    "model": "upstream-model",
+                },
+                {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_resolve_passthrough_runtime", return_value=runtime),
+                patch.object(adapter, "_provider_client_call_chat", new=AsyncMock(side_effect=_fake_provider_call)),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sk-local"},
+                    json={
+                        "model": "hermes-agent",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                )
+                assert resp.status == 200
+                assert "text/event-stream" in resp.headers.get("Content-Type", "")
+                body = await resp.text()
+                assert "chat.completion.chunk" in body
+                assert '"total_tokens": 3' in body
+                assert "[DONE]" in body
+
+    @pytest.mark.asyncio
+    async def test_responses_passthrough_uses_provider_client(self):
+        adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
+        app = _create_app(adapter)
+        runtime = self._runtime()
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_resolve_passthrough_runtime", return_value=runtime),
+                patch.object(
+                    adapter,
+                    "_provider_client_call_responses",
+                    new=AsyncMock(
+                        return_value={"id": "resp_provider", "object": "response", "status": "completed", "output": []}
+                    ),
+                ) as mock_provider_call,
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer sk-local"},
+                    json={"model": "hermes-agent", "input": "hello"},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["id"] == "resp_provider"
+                assert mock_provider_call.await_count == 1
+                mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_codex_chat_passthrough_uses_provider_client_flow(self):
+        adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
+        app = _create_app(adapter)
+        runtime = self._runtime(api_mode="codex_responses", provider="openai-codex")
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_resolve_passthrough_runtime", return_value=runtime),
+                patch.object(
+                    adapter,
+                    "_provider_client_call_chat",
+                    new=AsyncMock(
+                        return_value=(
+                            {
+                                "final_response": "from codex provider-client",
+                                "finish_reason": "stop",
+                                "model": "upstream-model",
+                            },
+                            {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+                        )
+                    ),
+                ) as mock_provider_call,
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sk-local"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {"role": "system", "content": "Be concise"},
+                            {"role": "user", "content": "hello"},
+                        ],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["object"] == "chat.completion"
+                assert data["choices"][0]["message"]["content"] == "from codex provider-client"
+                call_kwargs = mock_provider_call.await_args.kwargs
+                assert call_kwargs["runtime"]["api_mode"] == "codex_responses"
+                assert call_kwargs["stream"] is False
+
+    @pytest.mark.asyncio
+    async def test_passthrough_falls_back_to_agent_loop_when_runtime_not_compatible(self):
+        adapter = _make_adapter(passthrough_enabled=True)
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_resolve_passthrough_runtime", return_value=None),
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                mock_run.return_value = (
+                    {"final_response": "fallback", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "hi"}]},
+                )
+                assert resp.status == 200
+                mock_run.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Auth on endpoints
 # ---------------------------------------------------------------------------
 
@@ -1147,6 +1353,15 @@ class TestConfigIntegration:
             "http://localhost:3000",
             "http://127.0.0.1:3000",
         ]
+
+    def test_env_override_passthrough_settings(self, monkeypatch):
+        monkeypatch.setenv("API_SERVER_ENABLED", "true")
+        monkeypatch.setenv("API_SERVER_PASSTHROUGH_ENABLED", "true")
+        from gateway.config import load_gateway_config
+
+        config = load_gateway_config()
+        extra = config.platforms[Platform.API_SERVER].extra
+        assert extra.get("passthrough_enabled") is True
 
     def test_api_server_in_connected_platforms(self):
         config = GatewayConfig()

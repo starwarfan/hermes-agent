@@ -3991,6 +3991,266 @@ class AIAgent:
             finish_reason = "stop"
         return assistant_message, finish_reason
 
+    @staticmethod
+    def _single_call_normalize_content(content: Any) -> str:
+        """Normalize OpenAI-style content payloads into plain text."""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    if item:
+                        parts.append(item)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type in {"text", "input_text", "output_text"}:
+                    text = item.get("text", "")
+                    if text:
+                        parts.append(str(text))
+            return "\n".join(parts)
+        if isinstance(content, dict):
+            for key in ("text", "content"):
+                value = content.get(key)
+                if value:
+                    return str(value)
+            return json.dumps(content, ensure_ascii=False)
+        return str(content)
+
+    def _single_call_normalize_chat_messages(self, raw_messages: Any) -> List[Dict[str, Any]]:
+        """Normalize OpenAI chat-completions messages for single-call inference."""
+        messages: List[Dict[str, Any]] = []
+        if not isinstance(raw_messages, list):
+            return messages
+        for raw in raw_messages:
+            if not isinstance(raw, dict):
+                continue
+            role = str(raw.get("role") or "user").strip().lower() or "user"
+            msg: Dict[str, Any] = {
+                "role": role,
+                "content": self._single_call_normalize_content(raw.get("content")),
+            }
+            if raw.get("name"):
+                msg["name"] = str(raw.get("name"))
+            if isinstance(raw.get("tool_calls"), list):
+                msg["tool_calls"] = raw.get("tool_calls")
+            if raw.get("tool_call_id"):
+                msg["tool_call_id"] = raw.get("tool_call_id")
+            messages.append(msg)
+        return messages
+
+    def _single_call_responses_to_chat_messages(self, body: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Convert Responses API request body to chat-style messages."""
+        messages: List[Dict[str, Any]] = []
+        instructions = body.get("instructions")
+        if isinstance(instructions, str) and instructions.strip():
+            messages.append({"role": "system", "content": instructions.strip()})
+
+        raw_input = body.get("input")
+        if isinstance(raw_input, str):
+            messages.append({"role": "user", "content": raw_input})
+            return messages
+        if not isinstance(raw_input, list):
+            return messages
+
+        for item in raw_input:
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+                continue
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "user").strip().lower() or "user"
+            messages.append(
+                {
+                    "role": role,
+                    "content": self._single_call_normalize_content(item.get("content")),
+                }
+            )
+        return messages
+
+    @staticmethod
+    def _single_call_response_to_plain_json(response: Any) -> Dict[str, Any]:
+        """Convert SDK response objects into plain JSON-serializable dicts."""
+        if isinstance(response, dict):
+            return response
+        if response is None:
+            return {}
+        if hasattr(response, "model_dump"):
+            try:
+                dumped = response.model_dump(mode="json", exclude_none=True)
+                if isinstance(dumped, dict):
+                    return dumped
+            except Exception:
+                pass
+        if hasattr(response, "model_dump_json"):
+            try:
+                dumped = json.loads(response.model_dump_json())
+                if isinstance(dumped, dict):
+                    return dumped
+            except Exception:
+                pass
+        if hasattr(response, "to_dict"):
+            try:
+                dumped = response.to_dict()
+                if isinstance(dumped, dict):
+                    return dumped
+            except Exception:
+                pass
+        return {}
+
+    def _single_call_usage(self, response: Any) -> Dict[str, int]:
+        """Normalize usage into input/output/total token counts."""
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        raw_usage = getattr(response, "usage", None)
+        if not raw_usage:
+            return usage
+        try:
+            cu = normalize_usage(raw_usage, provider=self.provider, api_mode=self.api_mode)
+            usage = {
+                "input_tokens": cu.input_tokens,
+                "output_tokens": cu.output_tokens,
+                "total_tokens": cu.total_tokens,
+            }
+        except Exception:
+            pass
+        return usage
+
+    def _single_call_extract_assistant(self, response: Any) -> tuple[Any, str]:
+        """Extract assistant message + finish_reason from one provider response."""
+        if self.api_mode == "codex_responses":
+            return self._normalize_codex_response(response)
+
+        if self.api_mode == "anthropic_messages":
+            from agent.anthropic_adapter import normalize_anthropic_response
+
+            return normalize_anthropic_response(
+                response, strip_tool_prefix=self._is_anthropic_oauth
+            )
+
+        if response is None or not getattr(response, "choices", None):
+            return SimpleNamespace(content="", tool_calls=None), "stop"
+
+        first = response.choices[0]
+        assistant_message = getattr(first, "message", None) or SimpleNamespace(content="")
+        finish_reason = getattr(first, "finish_reason", None) or "stop"
+        content = getattr(assistant_message, "content", None)
+        if content is not None and not isinstance(content, str):
+            assistant_message.content = self._single_call_normalize_content(content)
+        return assistant_message, finish_reason
+
+    @staticmethod
+    def _single_call_chat_to_responses_payload(text: str, model_name: str, usage: Dict[str, int]) -> Dict[str, Any]:
+        return {
+            "id": f"resp_{uuid.uuid4().hex[:28]}",
+            "object": "response",
+            "status": "completed",
+            "created_at": int(time.time()),
+            "model": model_name,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                }
+            ],
+            "usage": usage,
+        }
+
+    def run_single_provider_call(
+        self,
+        *,
+        endpoint: str,
+        body: Dict[str, Any],
+        model_override: Optional[str] = None,
+        stream: bool = False,
+    ) -> Dict[str, Any]:
+        """Execute exactly one provider/client inference call (no tool loop)."""
+        if endpoint not in {"chat_completions", "responses"}:
+            raise ValueError(f"Unsupported single-call endpoint: {endpoint}")
+
+        original_model = self.model
+        original_tools = self.tools
+        try:
+            self.tools = []
+            if model_override:
+                self.model = model_override
+
+            if endpoint == "chat_completions":
+                api_messages = self._single_call_normalize_chat_messages(body.get("messages"))
+                api_kwargs = self._build_api_kwargs(api_messages)
+                if self.api_mode == "codex_responses":
+                    api_kwargs = self._preflight_codex_api_kwargs(api_kwargs, allow_stream=stream)
+                response = (
+                    self._interruptible_streaming_api_call(api_kwargs)
+                    if stream
+                    else self._interruptible_api_call(api_kwargs)
+                )
+                assistant_message, finish_reason = self._single_call_extract_assistant(response)
+                final_text = getattr(assistant_message, "content", "") or ""
+                usage = self._single_call_usage(response)
+                return {
+                    "final_response": final_text,
+                    "finish_reason": finish_reason or "stop",
+                    "model": self.model,
+                    "usage": usage,
+                }
+
+            # endpoint == "responses"
+            if self.api_mode == "codex_responses":
+                api_kwargs = dict(body)
+                if self.model:
+                    api_kwargs["model"] = self.model
+                allow_stream = bool(api_kwargs.get("stream"))
+                api_kwargs = self._preflight_codex_api_kwargs(api_kwargs, allow_stream=allow_stream)
+                response = (
+                    self._interruptible_streaming_api_call(api_kwargs)
+                    if allow_stream
+                    else self._interruptible_api_call(api_kwargs)
+                )
+                payload = self._single_call_response_to_plain_json(response)
+                usage = self._single_call_usage(response)
+                if payload:
+                    if "usage" not in payload:
+                        payload["usage"] = usage
+                    return {
+                        "responses_payload": payload,
+                        "usage": usage,
+                        "model": self.model,
+                    }
+                assistant_message, _ = self._single_call_extract_assistant(response)
+                synthesized = self._single_call_chat_to_responses_payload(
+                    getattr(assistant_message, "content", "") or "",
+                    self.model,
+                    usage,
+                )
+                return {
+                    "responses_payload": synthesized,
+                    "usage": usage,
+                    "model": self.model,
+                }
+
+            chat_messages = self._single_call_responses_to_chat_messages(body)
+            if not chat_messages:
+                raise ValueError("Missing or invalid 'input' for provider-client responses passthrough")
+            api_kwargs = self._build_api_kwargs(chat_messages)
+            response = self._interruptible_api_call(api_kwargs)
+            assistant_message, _ = self._single_call_extract_assistant(response)
+            final_text = getattr(assistant_message, "content", "") or ""
+            usage = self._single_call_usage(response)
+            payload = self._single_call_chat_to_responses_payload(final_text, self.model, usage)
+            return {
+                "responses_payload": payload,
+                "usage": usage,
+                "model": self.model,
+            }
+        finally:
+            self.model = original_model
+            self.tools = original_tools
+
     def _thread_identity(self) -> str:
         thread = threading.current_thread()
         return f"{thread.name}:{thread.ident}"

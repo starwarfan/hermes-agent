@@ -942,7 +942,12 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     api_server_cors_origins = os.getenv("API_SERVER_CORS_ORIGINS", "")
     api_server_port = os.getenv("API_SERVER_PORT")
     api_server_host = os.getenv("API_SERVER_HOST")
-    if api_server_enabled or api_server_key:
+    api_server_passthrough_enabled = os.getenv("API_SERVER_PASSTHROUGH_ENABLED")
+    if (
+        api_server_enabled
+        or api_server_key
+        or api_server_passthrough_enabled is not None
+    ):
         if Platform.API_SERVER not in config.platforms:
             config.platforms[Platform.API_SERVER] = PlatformConfig()
         config.platforms[Platform.API_SERVER].enabled = True
@@ -962,6 +967,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         api_server_model_name = os.getenv("API_SERVER_MODEL_NAME", "")
         if api_server_model_name:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
+        if api_server_passthrough_enabled is not None:
+            config.platforms[Platform.API_SERVER].extra["passthrough_enabled"] = (
+                api_server_passthrough_enabled.strip().lower() in ("true", "1", "yes", "on")
+            )
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes")

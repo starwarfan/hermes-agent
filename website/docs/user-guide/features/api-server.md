@@ -8,7 +8,7 @@ description: "Expose hermes-agent as an OpenAI-compatible API for any frontend"
 
 The API server exposes hermes-agent as an OpenAI-compatible HTTP endpoint. Any frontend that speaks the OpenAI format — Open WebUI, LobeChat, LibreChat, NextChat, ChatBox, and hundreds more — can connect to hermes-agent and use it as a backend.
 
-Your agent handles requests with its full toolset (terminal, file operations, web search, memory, skills) and returns the final response. When streaming, tool progress indicators appear inline so frontends can show what the agent is doing.
+By default, requests run through the full Hermes agent loop (tools, memory, skills). You can also enable provider-client passthrough mode, which uses Hermes' provider/client runtime for exactly one model call while skipping the multi-iteration agent loop.
 
 ## Quick Start
 
@@ -87,6 +87,8 @@ Standard OpenAI Chat Completions format. Stateless — the full conversation is 
 
 **Tool progress in streams**: When the agent calls tools during a streaming request, brief progress indicators are injected into the content stream as the tools start executing (e.g. `` `💻 pwd` ``, `` `🔍 Python docs` ``). These appear as inline markdown before the agent's response text, giving frontends like Open WebUI real-time visibility into tool execution.
 
+When passthrough mode is enabled, this endpoint runs a single provider-client call instead of invoking the full agent loop. For `codex_responses` runtimes (including `openai-codex`), Hermes translates incoming chat-completions requests into a Responses-format provider call internally.
+
 ### POST /v1/responses
 
 OpenAI Responses API format. Supports server-side conversation state via `previous_response_id` — the server stores full conversation history (including tool calls and results) so multi-turn context is preserved without the client managing it.
@@ -142,6 +144,8 @@ Use the `conversation` parameter instead of tracking response IDs:
 
 The server automatically chains to the latest response in that conversation. Like the `/title` command for gateway sessions.
 
+When passthrough mode is enabled, this endpoint runs a single provider-client call and returns Responses-format output. In passthrough mode Hermes does not store response chains locally.
+
 ### GET /v1/responses/\{id\}
 
 Retrieve a previously stored response by ID.
@@ -165,6 +169,17 @@ When a frontend sends a `system` message (Chat Completions) or `instructions` fi
 This means you can customize behavior per-frontend without losing capabilities:
 - Open WebUI system prompt: "You are a Python expert. Always include type hints."
 - The agent still has terminal, file tools, web search, memory, etc.
+
+## Passthrough Mode
+
+Passthrough mode enables direct inference through Hermes' configured runtime without running the full agent loop:
+
+- Client requests still authenticate to Hermes using `API_SERVER_KEY`.
+- Hermes executes one provider call using the server-side runtime credentials.
+- Supported only when the resolved runtime is OpenAI-compatible (`chat_completions` or `codex_responses`).
+- If passthrough is disabled, or runtime is not OpenAI-compatible, Hermes automatically falls back to normal agent-loop behavior.
+
+Passthrough mode bypasses Hermes tool-calling, memory orchestration, session continuity, and local response-store chaining.
 
 ## Authentication
 
@@ -194,6 +209,7 @@ The default bind address (`127.0.0.1`) is for local-only use. Browser access is 
 | `API_SERVER_KEY` | _(none)_ | Bearer token for auth |
 | `API_SERVER_CORS_ORIGINS` | _(none)_ | Comma-separated allowed browser origins |
 | `API_SERVER_MODEL_NAME` | _(profile name)_ | Model name on `/v1/models`. Defaults to profile name, or `hermes-agent` for default profile. |
+| `API_SERVER_PASSTHROUGH_ENABLED` | `false` | Run single provider-client inference for `/v1/chat/completions` and `/v1/responses` instead of the full Hermes agent loop |
 
 ### config.yaml
 
@@ -277,4 +293,4 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 
 - **Response storage** — stored responses (for `previous_response_id`) are persisted in SQLite and survive gateway restarts. Max 100 stored responses (LRU eviction).
 - **No file upload** — vision/document analysis via uploaded files is not yet supported through the API.
-- **Model field is cosmetic** — the `model` field in requests is accepted but the actual LLM model used is configured server-side in config.yaml.
+- **Model field behavior depends on mode** — in agent-loop mode, request `model` is cosmetic and runtime model is server-configured. In passthrough mode, Hermes maps local aliases like `hermes-agent` to the configured runtime model and executes a single direct provider call.

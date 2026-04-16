@@ -385,6 +385,13 @@ class APIServerAdapter(BasePlatformAdapter):
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
         )
+        self._passthrough_enabled: bool = self._coerce_bool(
+            extra.get(
+                "passthrough_enabled",
+                os.getenv("API_SERVER_PASSTHROUGH_ENABLED"),
+            ),
+            default=False,
+        )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -394,6 +401,21 @@ class APIServerAdapter(BasePlatformAdapter):
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+            return default
+        return bool(value)
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -459,6 +481,220 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         return "*" in self._cors_origins or origin in self._cors_origins
+
+    # ------------------------------------------------------------------
+    # Passthrough helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_openai_compatible_mode(api_mode: str) -> bool:
+        return api_mode in {"chat_completions", "codex_responses"}
+
+    def _resolve_passthrough_runtime(self) -> Optional[Dict[str, Any]]:
+        """Resolve current runtime for provider-client passthrough."""
+        if not self._passthrough_enabled:
+            return None
+        try:
+            from gateway.run import _resolve_gateway_model, _resolve_runtime_agent_kwargs
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            runtime_model = _resolve_gateway_model()
+        except Exception as exc:
+            logger.warning("API passthrough disabled for this request: runtime resolution failed: %s", exc)
+            return None
+
+        api_mode = str(runtime_kwargs.get("api_mode") or "").strip().lower()
+        if not self._is_openai_compatible_mode(api_mode):
+            return None
+
+        api_key = str(runtime_kwargs.get("api_key") or "").strip()
+        if not api_key:
+            logger.warning(
+                "API passthrough requested but upstream runtime is missing "
+                "api_key (provider=%s, api_mode=%s)",
+                runtime_kwargs.get("provider"),
+                api_mode,
+            )
+            return None
+
+        return {
+            "provider": str(runtime_kwargs.get("provider") or "").strip().lower(),
+            "api_mode": api_mode,
+            "api_key": api_key,
+            "model": str(runtime_model or "").strip(),
+        }
+
+    def _normalize_passthrough_model(self, client_model: Any, runtime_model: str) -> str:
+        """Map local model aliases to the upstream runtime model name."""
+        requested = str(client_model or "").strip()
+        upstream_model = str(runtime_model or "").strip()
+        if not requested:
+            return upstream_model
+        if requested in {self._model_name, "hermes-agent"} and upstream_model:
+            return upstream_model
+        return requested
+
+    def _provider_client_call_chat_sync(
+        self,
+        *,
+        body: Dict[str, Any],
+        runtime: Dict[str, Any],
+        stream: bool,
+        stream_delta_callback=None,
+    ) -> tuple[Dict[str, Any], Dict[str, int]]:
+        mapped_model = self._normalize_passthrough_model(body.get("model"), runtime.get("model", ""))
+        agent = self._create_agent(
+            session_id=f"api-passthrough-{uuid.uuid4().hex[:12]}",
+            stream_delta_callback=stream_delta_callback,
+        )
+        result = agent.run_single_provider_call(
+            endpoint="chat_completions",
+            body=body,
+            model_override=mapped_model or None,
+            stream=stream,
+        )
+        usage = result.get("usage") or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        return {
+            "final_response": result.get("final_response", ""),
+            "finish_reason": result.get("finish_reason", "stop"),
+            "model": result.get("model") or mapped_model or str(runtime.get("model") or self._model_name),
+        }, usage
+
+    async def _provider_client_call_chat(
+        self,
+        *,
+        body: Dict[str, Any],
+        runtime: Dict[str, Any],
+        stream: bool,
+        stream_delta_callback=None,
+    ) -> tuple[Dict[str, Any], Dict[str, int]]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._provider_client_call_chat_sync(
+                body=body,
+                runtime=runtime,
+                stream=stream,
+                stream_delta_callback=stream_delta_callback,
+            ),
+        )
+
+    def _provider_client_call_responses_sync(self, *, body: Dict[str, Any], runtime: Dict[str, Any]) -> Dict[str, Any]:
+        mapped_model = self._normalize_passthrough_model(body.get("model"), runtime.get("model", ""))
+        agent = self._create_agent(session_id=f"api-passthrough-{uuid.uuid4().hex[:12]}")
+        result = agent.run_single_provider_call(
+            endpoint="responses",
+            body=body,
+            model_override=mapped_model or None,
+            stream=bool(body.get("stream", False)),
+        )
+        payload = result.get("responses_payload")
+        if isinstance(payload, dict):
+            return payload
+        return {
+            "id": f"resp_{uuid.uuid4().hex[:28]}",
+            "object": "response",
+            "status": "completed",
+            "created_at": int(time.time()),
+            "model": result.get("model") or mapped_model or str(runtime.get("model") or self._model_name),
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": ""}],
+                }
+            ],
+            "usage": result.get("usage") or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        }
+
+    async def _provider_client_call_responses(self, *, body: Dict[str, Any], runtime: Dict[str, Any]) -> Dict[str, Any]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._provider_client_call_responses_sync(body=body, runtime=runtime),
+        )
+
+    async def _maybe_passthrough_chat(
+        self, request: "web.Request", body: Dict[str, Any],
+    ) -> Optional["web.Response"]:
+        runtime = self._resolve_passthrough_runtime()
+        if not runtime:
+            return None
+
+        stream = bool(body.get("stream", False))
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        model_name = self._normalize_passthrough_model(body.get("model"), runtime.get("model", "")) or self._model_name
+        created = int(time.time())
+
+        if stream:
+            import queue as _q
+
+            _stream_q: _q.Queue = _q.Queue()
+
+            def _on_delta(delta):
+                if delta is not None:
+                    _stream_q.put(delta)
+
+            task = asyncio.ensure_future(
+                self._provider_client_call_chat(
+                    body=body,
+                    runtime=runtime,
+                    stream=True,
+                    stream_delta_callback=_on_delta,
+                )
+            )
+            return await self._write_sse_chat_completion(
+                request, completion_id, model_name, created, _stream_q, task,
+            )
+
+        try:
+            result, usage = await self._provider_client_call_chat(
+                body=body, runtime=runtime, stream=False,
+            )
+        except Exception as exc:
+            logger.error("Provider-client passthrough chat failed: %s", exc, exc_info=True)
+            return web.json_response(
+                _openai_error(f"Provider-client passthrough failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+
+        response_data = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": result.get("model") or model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": result.get("final_response", "")},
+                    "finish_reason": result.get("finish_reason", "stop"),
+                }
+            ],
+            "usage": {
+                "prompt_tokens": usage.get("input_tokens", 0),
+                "completion_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            },
+        }
+        return web.json_response(response_data)
+
+    async def _maybe_passthrough_responses(
+        self, request: "web.Request", body: Dict[str, Any],
+    ) -> Optional["web.Response"]:
+        del request
+        runtime = self._resolve_passthrough_runtime()
+        if not runtime:
+            return None
+        try:
+            payload = await self._provider_client_call_responses(body=body, runtime=runtime)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
+        except Exception as exc:
+            logger.error("Provider-client passthrough responses failed: %s", exc, exc_info=True)
+            return web.json_response(
+                _openai_error(f"Provider-client passthrough failed: {exc}", err_type="server_error"),
+                status=500,
+            )
+        return web.json_response(payload)
 
     # ------------------------------------------------------------------
     # Auth helper
@@ -606,6 +842,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = body.get("stream", False)
+
+        passthrough_response = await self._maybe_passthrough_chat(request, body)
+        if passthrough_response is not None:
+            return passthrough_response
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -957,6 +1197,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
                 status=400,
             )
+
+        passthrough_response = await self._maybe_passthrough_responses(request, body)
+        if passthrough_response is not None:
+            return passthrough_response
 
         raw_input = body.get("input")
         if raw_input is None:
@@ -1861,8 +2105,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     self.name,
                 )
             logger.info(
-                "[%s] API server listening on http://%s:%d (model: %s)",
-                self.name, self._host, self._port, self._model_name,
+                "[%s] API server listening on http://%s:%d (model: %s, passthrough: %s)",
+                self.name,
+                self._host,
+                self._port,
+                self._model_name,
+                "on" if self._passthrough_enabled else "off",
             )
             return True
 
