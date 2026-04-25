@@ -533,6 +533,76 @@ class APIServerAdapter(BasePlatformAdapter):
             return upstream_model
         return requested
 
+    def _normalize_codex_passthrough_body(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize Codex-style /v1/responses requests for strict preflight.
+
+        Passthrough requests in ``codex_responses`` mode are validated by
+        ``AIAgent._preflight_codex_api_kwargs`` which expects:
+        - ``input`` as a list of input items
+        - ``instructions`` present (may be empty, defaults later)
+        - message items in ``{"role": "...", "content": "..."}`` shape
+
+        Codex clients can send ``{"type": "message", "role": "developer"}``
+        entries and list-based content parts. Convert those into Hermes'
+        accepted shape while preserving function_call / reasoning items.
+        """
+        normalized = dict(body)
+        raw_input = body.get("input")
+
+        # Ensure required Codex preflight keys are present/compatible.
+        normalized.setdefault("instructions", "")
+        normalized["store"] = False
+
+        if isinstance(raw_input, str):
+            normalized["input"] = [{"role": "user", "content": raw_input}]
+            return normalized
+        if not isinstance(raw_input, list):
+            return normalized
+
+        instructions_parts: List[str] = []
+        existing_instructions = normalized.get("instructions")
+        if isinstance(existing_instructions, str) and existing_instructions.strip():
+            instructions_parts.append(existing_instructions.strip())
+
+        normalized_items: List[Any] = []
+        for item in raw_input:
+            if isinstance(item, str):
+                normalized_items.append({"role": "user", "content": item})
+                continue
+            if not isinstance(item, dict):
+                normalized_items.append(item)
+                continue
+
+            item_type = str(item.get("type") or "").strip().lower()
+            role = str(item.get("role") or "").strip().lower()
+
+            if role in {"developer", "system"}:
+                content_text = _normalize_chat_content(item.get("content", ""))
+                if content_text.strip():
+                    instructions_parts.append(content_text.strip())
+                continue
+
+            if item_type in {"function_call", "function_call_output", "reasoning"}:
+                normalized_items.append(item)
+                continue
+
+            if item_type == "message" or role in {"user", "assistant"}:
+                normalized_items.append(
+                    {
+                        "role": role or "user",
+                        "content": _normalize_chat_content(item.get("content", "")),
+                    }
+                )
+                continue
+
+            # Preserve unknown shapes so downstream preflight can return a
+            # precise validation error message.
+            normalized_items.append(item)
+
+        normalized["input"] = normalized_items
+        normalized["instructions"] = "\n\n".join(instructions_parts).strip() if instructions_parts else ""
+        return normalized
+
     def _provider_client_call_chat_sync(
         self,
         *,
@@ -684,8 +754,13 @@ class APIServerAdapter(BasePlatformAdapter):
         runtime = self._resolve_passthrough_runtime()
         if not runtime:
             return None
+        provider_body = (
+            self._normalize_codex_passthrough_body(body)
+            if runtime.get("api_mode") == "codex_responses"
+            else body
+        )
         try:
-            payload = await self._provider_client_call_responses(body=body, runtime=runtime)
+            payload = await self._provider_client_call_responses(body=provider_body, runtime=runtime)
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc)), status=400)
         except Exception as exc:

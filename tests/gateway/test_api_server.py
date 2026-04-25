@@ -1205,6 +1205,78 @@ class TestPassthroughMode:
                 mock_run.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_codex_responses_passthrough_normalizes_developer_message_items(self):
+        adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
+        app = _create_app(adapter)
+        runtime = self._runtime(api_mode="codex_responses", provider="openai-codex")
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_resolve_passthrough_runtime", return_value=runtime),
+                patch.object(
+                    adapter,
+                    "_provider_client_call_responses",
+                    new=AsyncMock(
+                        return_value={"id": "resp_provider", "object": "response", "status": "completed", "output": []}
+                    ),
+                ) as mock_provider_call,
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer sk-local"},
+                    json={
+                        "model": "hermes-agent",
+                        "store": True,
+                        "input": [
+                            {
+                                "type": "message",
+                                "role": "developer",
+                                "content": [{"type": "input_text", "text": "Be concise."}],
+                            },
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "hello"}],
+                            },
+                        ],
+                    },
+                )
+                assert resp.status == 200
+                call_kwargs = mock_provider_call.await_args.kwargs
+                forwarded_body = call_kwargs["body"]
+                assert forwarded_body["store"] is False
+                assert forwarded_body["instructions"] == "Be concise."
+                assert forwarded_body["input"] == [{"role": "user", "content": "hello"}]
+
+    @pytest.mark.asyncio
+    async def test_codex_responses_passthrough_normalizes_string_input_to_list(self):
+        adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
+        app = _create_app(adapter)
+        runtime = self._runtime(api_mode="codex_responses", provider="openai-codex")
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_resolve_passthrough_runtime", return_value=runtime),
+                patch.object(
+                    adapter,
+                    "_provider_client_call_responses",
+                    new=AsyncMock(
+                        return_value={"id": "resp_provider", "object": "response", "status": "completed", "output": []}
+                    ),
+                ) as mock_provider_call,
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer sk-local"},
+                    json={"model": "hermes-agent", "input": "hello"},
+                )
+                assert resp.status == 200
+                forwarded_body = mock_provider_call.await_args.kwargs["body"]
+                assert forwarded_body["input"] == [{"role": "user", "content": "hello"}]
+                assert "instructions" in forwarded_body
+                assert forwarded_body["store"] is False
+
+    @pytest.mark.asyncio
     async def test_codex_chat_passthrough_uses_provider_client_flow(self):
         adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
         app = _create_app(adapter)
