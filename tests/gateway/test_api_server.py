@@ -226,17 +226,7 @@ def _make_adapter(
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
-    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
-    app = web.Application(middlewares=mws)
-    app["api_server_adapter"] = adapter
-    app.router.add_get("/health", adapter._handle_health)
-    app.router.add_get("/v1/health", adapter._handle_health)
-    app.router.add_get("/v1/models", adapter._handle_models)
-    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
-    app.router.add_post("/v1/responses", adapter._handle_responses)
-    app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
-    app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
-    return app
+    return adapter._build_app()
 
 
 @pytest.fixture
@@ -355,6 +345,83 @@ class TestModelsEndpoint:
                 headers={"Authorization": "Bearer sk-secret"},
             )
             assert resp.status == 200
+
+
+class _FakeUpstreamResponse:
+    def __init__(self, body: bytes, *, status: int = 200, headers: dict[str, str] | None = None):
+        self.status = status
+        self.headers = headers or {"Content-Type": "application/json"}
+        self._body = body
+        self.content = self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def iter_chunked(self, size: int):
+        del size
+        yield self._body
+
+
+class _FakeClientSession:
+    def __init__(self, response_body: bytes):
+        self.requests = []
+        self._response_body = response_body
+
+    def request(self, method, url, headers=None, data=None):
+        self.requests.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": headers or {},
+                "data": data or b"",
+            }
+        )
+        return _FakeUpstreamResponse(self._response_body)
+
+    async def close(self):
+        return None
+
+
+class TestCodexSubrouter:
+    @pytest.mark.asyncio
+    async def test_codex_models_route_is_mounted(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/codex/v1/models",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["data"][0]["owned_by"] == "codex-passthrough"
+
+    @pytest.mark.asyncio
+    async def test_codex_proxy_bypasses_normal_body_limit(self, auth_adapter):
+        fake_session = _FakeClientSession(b'{"ok": true}')
+        payload = b"x" * (1_000_000 + 1)
+        app = _create_app(auth_adapter)
+        with (
+            patch("gateway.platforms.codex_passthrough.ClientSession", return_value=fake_session),
+            patch("gateway.platforms.codex_passthrough._load_upstream_token", return_value="upstream-token"),
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/codex/v1/responses",
+                    data=payload,
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "Content-Type": "application/json",
+                    },
+                )
+                assert resp.status == 200
+                assert await resp.json() == {"ok": True}
+        assert len(fake_session.requests) == 1
+        assert fake_session.requests[0]["url"] == "https://chatgpt.com/backend-api/codex/responses"
+        assert fake_session.requests[0]["headers"]["Authorization"] == "Bearer upstream-token"
+        assert len(fake_session.requests[0]["data"]) == len(payload)
 
 
 # ---------------------------------------------------------------------------

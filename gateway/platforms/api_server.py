@@ -45,6 +45,10 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.platforms.codex_passthrough import (
+    create_codex_passthrough_app,
+    resolve_codex_proxy_max_body,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +60,7 @@ MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+CODEX_SUBAPP_PREFIX = "/codex"
 
 
 def _normalize_chat_content(
@@ -279,6 +284,8 @@ if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
         """Reject overly large request bodies early based on Content-Length."""
+        if request.path == CODEX_SUBAPP_PREFIX or request.path.startswith(f"{CODEX_SUBAPP_PREFIX}/"):
+            return await handler(request)
         if request.method in ("POST", "PUT", "PATCH"):
             cl = request.headers.get("Content-Length")
             if cl is not None:
@@ -451,6 +458,33 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             pass
         return "hermes-agent"
+
+    def _build_app(self) -> "web.Application":
+        mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+        app = web.Application(
+            middlewares=mws,
+            client_max_size=max(MAX_REQUEST_BYTES, resolve_codex_proxy_max_body()),
+        )
+        app["api_server_adapter"] = self
+        app.router.add_get("/health", self._handle_health)
+        app.router.add_get("/v1/health", self._handle_health)
+        app.router.add_get("/v1/models", self._handle_models)
+        app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
+        app.router.add_post("/v1/responses", self._handle_responses)
+        app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
+        app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+        app.router.add_get("/api/jobs", self._handle_list_jobs)
+        app.router.add_post("/api/jobs", self._handle_create_job)
+        app.router.add_get("/api/jobs/{job_id}", self._handle_get_job)
+        app.router.add_patch("/api/jobs/{job_id}", self._handle_update_job)
+        app.router.add_delete("/api/jobs/{job_id}", self._handle_delete_job)
+        app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
+        app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
+        app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+        app.router.add_post("/v1/runs", self._handle_runs)
+        app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+        app.add_subapp(CODEX_SUBAPP_PREFIX, create_codex_passthrough_app(proxy_key=self._api_key))
+        return app
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
@@ -2105,28 +2139,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
-            self._app = web.Application(middlewares=mws)
-            self._app["api_server_adapter"] = self
-            self._app.router.add_get("/health", self._handle_health)
-            self._app.router.add_get("/v1/health", self._handle_health)
-            self._app.router.add_get("/v1/models", self._handle_models)
-            self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
-            self._app.router.add_post("/v1/responses", self._handle_responses)
-            self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
-            self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
-            # Cron jobs management API
-            self._app.router.add_get("/api/jobs", self._handle_list_jobs)
-            self._app.router.add_post("/api/jobs", self._handle_create_job)
-            self._app.router.add_get("/api/jobs/{job_id}", self._handle_get_job)
-            self._app.router.add_patch("/api/jobs/{job_id}", self._handle_update_job)
-            self._app.router.add_delete("/api/jobs/{job_id}", self._handle_delete_job)
-            self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
-            self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
-            self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
-            # Structured event streaming
-            self._app.router.add_post("/v1/runs", self._handle_runs)
-            self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app = self._build_app()
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
@@ -2187,12 +2200,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     self.name,
                 )
             logger.info(
-                "[%s] API server listening on http://%s:%d (model: %s, passthrough: %s)",
+                "[%s] API server listening on http://%s:%d (model: %s, passthrough: %s, codex: %s/v1)",
                 self.name,
                 self._host,
                 self._port,
                 self._model_name,
                 "on" if self._passthrough_enabled else "off",
+                CODEX_SUBAPP_PREFIX,
             )
             return True
 
