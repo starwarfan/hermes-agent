@@ -565,18 +565,22 @@ class APIServerAdapter(BasePlatformAdapter):
             instructions_parts.append(existing_instructions.strip())
 
         normalized_items: List[Any] = []
+        leading_prompt_phase = True
         for item in raw_input:
             if isinstance(item, str):
                 normalized_items.append({"role": "user", "content": item})
+                leading_prompt_phase = False
                 continue
             if not isinstance(item, dict):
                 normalized_items.append(item)
+                leading_prompt_phase = False
                 continue
 
             item_type = str(item.get("type") or "").strip().lower()
             role = str(item.get("role") or "").strip().lower()
 
-            if role in {"developer", "system"}:
+            is_message_shape = item_type in {"", "message"}
+            if leading_prompt_phase and is_message_shape and role in {"developer", "system"}:
                 content_text = _normalize_chat_content(item.get("content", ""))
                 if content_text.strip():
                     instructions_parts.append(content_text.strip())
@@ -584,20 +588,23 @@ class APIServerAdapter(BasePlatformAdapter):
 
             if item_type in {"function_call", "function_call_output", "reasoning"}:
                 normalized_items.append(item)
+                leading_prompt_phase = False
                 continue
 
-            if item_type == "message" or role in {"user", "assistant"}:
+            if is_message_shape and role in {"user", "assistant", "developer", "system"}:
                 normalized_items.append(
                     {
                         "role": role or "user",
                         "content": _normalize_chat_content(item.get("content", "")),
                     }
                 )
+                leading_prompt_phase = False
                 continue
 
             # Preserve unknown shapes so downstream preflight can return a
             # precise validation error message.
             normalized_items.append(item)
+            leading_prompt_phase = False
 
         normalized["input"] = normalized_items
         normalized["instructions"] = "\n\n".join(instructions_parts).strip() if instructions_parts else ""

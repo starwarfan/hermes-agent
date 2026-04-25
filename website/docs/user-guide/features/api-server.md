@@ -146,6 +146,14 @@ The server automatically chains to the latest response in that conversation. Lik
 
 When passthrough mode is enabled, this endpoint runs a single provider-client call and returns Responses-format output. In passthrough mode Hermes does not store response chains locally.
 
+For `codex_responses` runtimes, Hermes normalizes incoming payloads before forwarding:
+
+- `input` strings are converted to item-list form (`[{ "role": "user", "content": ... }]`).
+- Leading `developer` / `system` message items are lifted into top-level `instructions`.
+- `type: "message"` items are flattened to plain text content when possible.
+- `function_call`, `function_call_output`, and `reasoning` items are forwarded as-is.
+- Malformed or unsupported item shapes are preserved for strict downstream validation, which returns a 400 error.
+
 ### GET /v1/responses/\{id\}
 
 Retrieve a previously stored response by ID.

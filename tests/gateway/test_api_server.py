@@ -1277,6 +1277,39 @@ class TestPassthroughMode:
                 assert forwarded_body["store"] is False
 
     @pytest.mark.asyncio
+    async def test_codex_responses_passthrough_preserves_malformed_items_for_400(self):
+        adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
+        app = _create_app(adapter)
+        runtime = self._runtime(api_mode="codex_responses", provider="openai-codex")
+
+        async def _fake_provider_call(*, body, runtime):
+            assert body["input"][0]["type"] == "bogus_message_type"
+            raise ValueError("Codex Responses input[0] has unsupported item shape (type='bogus_message_type', role='user').")
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_resolve_passthrough_runtime", return_value=runtime),
+                patch.object(
+                    adapter,
+                    "_provider_client_call_responses",
+                    new=AsyncMock(side_effect=_fake_provider_call),
+                ),
+            ):
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer sk-local"},
+                    json={
+                        "model": "hermes-agent",
+                        "input": [
+                            {"type": "bogus_message_type", "role": "user", "content": "hello"},
+                        ],
+                    },
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "unsupported item shape" in data["error"]["message"]
+
+    @pytest.mark.asyncio
     async def test_codex_chat_passthrough_uses_provider_client_flow(self):
         adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
         app = _create_app(adapter)

@@ -3650,14 +3650,9 @@ class AIAgent:
                     normalized.append(reasoning_item)
                 continue
 
-            role = item.get("role")
-            if role in {"user", "assistant"}:
-                content = item.get("content", "")
-                if content is None:
-                    content = ""
-                if not isinstance(content, str):
-                    content = str(content)
-
+            role = str(item.get("role") or "").strip().lower()
+            if role in {"developer", "system", "user", "assistant"} and str(item_type or "").strip().lower() in {"", "message"}:
+                content = self._single_call_normalize_content(item.get("content", ""))
                 normalized.append({"role": role, "content": content})
                 continue
 
@@ -3676,7 +3671,7 @@ class AIAgent:
         if not isinstance(api_kwargs, dict):
             raise ValueError("Codex Responses request must be a dict.")
 
-        required = {"model", "instructions", "input"}
+        required = {"model", "input"}
         missing = [key for key in required if key not in api_kwargs]
         if missing:
             raise ValueError(f"Codex Responses request missing required field(s): {', '.join(sorted(missing))}.")

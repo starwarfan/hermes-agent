@@ -615,6 +615,51 @@ def test_preflight_codex_api_kwargs_strips_optional_function_call_id(monkeypatch
     assert "id" not in fn_call
 
 
+def test_preflight_codex_input_accepts_message_items_with_developer_and_system_roles(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    normalized = agent._preflight_codex_input_items(
+        [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "Be concise."}],
+            },
+            {"type": "message", "role": "system", "content": "Prefer bullet points."},
+            {"type": "message", "role": "user", "content": [{"type": "text", "text": "hello"}]},
+        ]
+    )
+
+    assert normalized == [
+        {"role": "developer", "content": "Be concise."},
+        {"role": "system", "content": "Prefer bullet points."},
+        {"role": "user", "content": "hello"},
+    ]
+
+
+def test_preflight_codex_input_rejects_unknown_message_type_even_with_role(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    with pytest.raises(ValueError, match="unsupported item shape"):
+        agent._preflight_codex_input_items(
+            [{"type": "bogus_message_type", "role": "user", "content": "hi"}]
+        )
+
+
+def test_preflight_codex_api_kwargs_allows_missing_instructions(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    result = agent._preflight_codex_api_kwargs(
+        {
+            "model": "gpt-5-codex",
+            "input": [{"role": "user", "content": "hi"}],
+            "store": False,
+        }
+    )
+
+    assert result["instructions"] == run_agent.DEFAULT_AGENT_IDENTITY
+
+
 def test_preflight_codex_api_kwargs_rejects_function_call_output_without_call_id(monkeypatch):
     agent = _build_agent(monkeypatch)
 
