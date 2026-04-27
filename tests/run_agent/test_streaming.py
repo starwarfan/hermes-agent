@@ -329,6 +329,55 @@ class TestStreamingCallbacks:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_tool_call_deltas_fire_callback(self, mock_close, mock_create):
+        """Streaming tool call deltas are surfaced for API adapters."""
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(index=0, tc_id="call_789", name="terminal")
+            ]),
+            _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(index=0, arguments='{"command": "ls"}')
+            ]),
+            _make_stream_chunk(finish_reason="tool_calls"),
+        ]
+
+        tool_deltas = []
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_tool_call_delta_callback=lambda d: tool_deltas.append(d),
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        agent._interruptible_streaming_api_call({})
+
+        assert tool_deltas == [
+            {
+                "index": 0,
+                "id": "call_789",
+                "type": "function",
+                "function": {"name": "terminal"},
+            },
+            {
+                "index": 0,
+                "id": None,
+                "type": "function",
+                "function": {"arguments": '{"command": "ls"}'},
+            },
+        ]
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
     def test_text_suppressed_when_tool_calls_present(self, mock_close, mock_create):
         """Text deltas are suppressed when tool calls are also in the stream."""
         from run_agent import AIAgent

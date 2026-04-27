@@ -380,6 +380,152 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert response.output[0].content[0].text == "streamed create ok"
 
 
+def test_run_single_provider_call_chat_returns_tool_calls_for_codex(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: _codex_tool_call_response())
+
+    result = agent.run_single_provider_call(
+        endpoint="chat_completions",
+        body={"messages": [{"role": "user", "content": "Ping"}]},
+    )
+
+    assert result["final_response"] == ""
+    assert result["finish_reason"] == "tool_calls"
+    assert result["tool_calls"] == [
+        {
+            "id": "call_1",
+            "call_id": "call_1",
+            "response_item_id": "fc_1",
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "arguments": "{}",
+            },
+        }
+    ]
+
+
+def test_run_single_provider_call_chat_codex_forwards_client_tool_fields(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    captured = {}
+
+    def _fake_api_call(api_kwargs):
+        captured["api_kwargs"] = api_kwargs
+        return _codex_message_response("OK")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    result = agent.run_single_provider_call(
+        endpoint="chat_completions",
+        body={
+            "messages": [{"role": "user", "content": "Ping"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "description": "Run shell commands.",
+                        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+                    },
+                }
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "terminal"}},
+            "parallel_tool_calls": False,
+        },
+    )
+
+    assert result["final_response"] == "OK"
+    assert captured["api_kwargs"]["tools"] == [
+        {
+            "type": "function",
+            "name": "terminal",
+            "description": "Run shell commands.",
+            "strict": False,
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+        }
+    ]
+    assert captured["api_kwargs"]["tool_choice"] == {"type": "function", "function": {"name": "terminal"}}
+    assert captured["api_kwargs"]["parallel_tool_calls"] is False
+
+
+def test_run_single_provider_call_chat_codex_omits_tool_defaults_when_absent(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    captured = {}
+
+    def _fake_api_call(api_kwargs):
+        captured["api_kwargs"] = api_kwargs
+        return _codex_message_response("OK")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    result = agent.run_single_provider_call(
+        endpoint="chat_completions",
+        body={"messages": [{"role": "user", "content": "Ping"}]},
+    )
+
+    assert result["final_response"] == "OK"
+    assert "tools" not in captured["api_kwargs"]
+    assert "tool_choice" not in captured["api_kwargs"]
+    assert "parallel_tool_calls" not in captured["api_kwargs"]
+
+
+def test_run_single_provider_call_chat_codex_maps_max_tokens_and_temperature(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    captured = {}
+
+    def _fake_api_call(api_kwargs):
+        captured["api_kwargs"] = api_kwargs
+        return _codex_message_response("OK")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    result = agent.run_single_provider_call(
+        endpoint="chat_completions",
+        body={
+            "messages": [{"role": "user", "content": "Ping"}],
+            "max_tokens": 256,
+            "temperature": 0.3,
+        },
+    )
+
+    assert result["final_response"] == "OK"
+    assert captured["api_kwargs"]["max_output_tokens"] == 256
+    assert captured["api_kwargs"]["temperature"] == 0.3
+
+
+def test_run_single_provider_call_chat_codex_rejects_stop(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    with pytest.raises(ValueError, match="request 'stop' is not supported"):
+        agent.run_single_provider_call(
+            endpoint="chat_completions",
+            body={
+                "messages": [{"role": "user", "content": "Ping"}],
+                "stop": ["DONE"],
+            },
+        )
+
+
+def test_run_single_provider_call_chat_codex_rejects_malformed_client_tools(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    with pytest.raises(ValueError, match="missing a valid function name"):
+        agent.run_single_provider_call(
+            endpoint="chat_completions",
+            body={
+                "messages": [{"role": "user", "content": "Ping"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            },
+        )
+
+
 def test_run_conversation_codex_plain_text(monkeypatch):
     agent = _build_agent(monkeypatch)
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: _codex_message_response("OK"))

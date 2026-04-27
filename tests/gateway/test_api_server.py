@@ -1160,6 +1160,48 @@ class TestPassthroughMode:
             "model": model,
         }
 
+    def test_provider_client_chat_sync_preserves_tool_calls(self):
+        adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
+        runtime = self._runtime(api_mode="codex_responses", provider="openai-codex")
+
+        fake_agent = MagicMock()
+        fake_agent.run_single_provider_call.return_value = {
+            "final_response": "",
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": "{\"command\":\"pwd\"}",
+                    },
+                }
+            ],
+            "model": "upstream-model",
+            "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+        }
+
+        with patch.object(adapter, "_create_agent", return_value=fake_agent):
+            result, usage = adapter._provider_client_call_chat_sync(
+                body={"model": "hermes-agent", "messages": [{"role": "user", "content": "run pwd"}]},
+                runtime=runtime,
+                stream=False,
+            )
+
+        assert result["finish_reason"] == "tool_calls"
+        assert result["tool_calls"] == [
+            {
+                "id": "call_123",
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "arguments": "{\"command\":\"pwd\"}",
+                },
+            }
+        ]
+        assert usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+
     @pytest.mark.asyncio
     async def test_chat_passthrough_non_stream_uses_provider_client(self):
         adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
@@ -1202,6 +1244,34 @@ class TestPassthroughMode:
                 mock_run.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_chat_passthrough_non_stream_returns_400_for_invalid_request(self):
+        adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
+        app = _create_app(adapter)
+        runtime = self._runtime(api_mode="codex_responses", provider="openai-codex")
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_resolve_passthrough_runtime", return_value=runtime),
+                patch.object(
+                    adapter,
+                    "_provider_client_call_chat",
+                    new=AsyncMock(side_effect=ValueError("Chat Completions request 'stop' is not supported for codex_responses passthrough.")),
+                ),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sk-local"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stop": ["DONE"],
+                    },
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "request 'stop' is not supported" in data["error"]["message"]
+
+    @pytest.mark.asyncio
     async def test_chat_passthrough_stream_uses_provider_client(self):
         adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
         app = _create_app(adapter)
@@ -1240,6 +1310,55 @@ class TestPassthroughMode:
                 body = await resp.text()
                 assert "chat.completion.chunk" in body
                 assert '"total_tokens": 3' in body
+                assert "[DONE]" in body
+
+    @pytest.mark.asyncio
+    async def test_chat_passthrough_stream_emits_tool_call_chunks(self):
+        adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
+        app = _create_app(adapter)
+        runtime = self._runtime(api_mode="codex_responses", provider="openai-codex")
+
+        async def _fake_provider_call(**kwargs):
+            tool_cb = kwargs.get("stream_tool_call_delta_callback")
+            if tool_cb:
+                tool_cb(
+                    {
+                        "index": 0,
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": "{\"command\":\"pwd\"}",
+                        },
+                    }
+                )
+            return (
+                {
+                    "final_response": "",
+                    "finish_reason": "tool_calls",
+                    "model": "upstream-model",
+                },
+                {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_resolve_passthrough_runtime", return_value=runtime),
+                patch.object(adapter, "_provider_client_call_chat", new=AsyncMock(side_effect=_fake_provider_call)),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sk-local"},
+                    json={
+                        "model": "hermes-agent",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "run pwd"}],
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert '"tool_calls": [{"index": 0, "id": "call_123", "type": "function"' in body
+                assert '"finish_reason": "tool_calls"' in body or '"finish_reason":"tool_calls"' in body
                 assert "[DONE]" in body
 
     @pytest.mark.asyncio
@@ -1418,6 +1537,66 @@ class TestPassthroughMode:
                 call_kwargs = mock_provider_call.await_args.kwargs
                 assert call_kwargs["runtime"]["api_mode"] == "codex_responses"
                 assert call_kwargs["stream"] is False
+
+    @pytest.mark.asyncio
+    async def test_codex_chat_passthrough_returns_openai_tool_calls(self):
+        adapter = _make_adapter(api_key="sk-local", passthrough_enabled=True)
+        app = _create_app(adapter)
+        runtime = self._runtime(api_mode="codex_responses", provider="openai-codex")
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_resolve_passthrough_runtime", return_value=runtime),
+                patch.object(
+                    adapter,
+                    "_provider_client_call_chat",
+                    new=AsyncMock(
+                        return_value=(
+                            {
+                                "final_response": "",
+                                "finish_reason": "tool_calls",
+                                "model": "upstream-model",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_123",
+                                        "call_id": "call_123",
+                                        "response_item_id": "fc_123",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "terminal",
+                                            "arguments": "{\"command\":\"pwd\"}",
+                                        },
+                                    }
+                                ],
+                            },
+                            {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+                        )
+                    ),
+                ),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sk-local"},
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "run pwd"}],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                choice = data["choices"][0]
+                assert choice["finish_reason"] == "tool_calls"
+                assert choice["message"]["content"] is None
+                assert choice["message"]["tool_calls"] == [
+                    {
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": "{\"command\":\"pwd\"}",
+                        },
+                    }
+                ]
 
     @pytest.mark.asyncio
     async def test_passthrough_falls_back_to_agent_loop_when_runtime_not_compatible(self):

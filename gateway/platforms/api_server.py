@@ -567,6 +567,47 @@ class APIServerAdapter(BasePlatformAdapter):
             return upstream_model
         return requested
 
+    @staticmethod
+    def _chat_completion_output_tool_calls(tool_calls: Any) -> Optional[List[Dict[str, Any]]]:
+        """Return standard Chat Completions tool_calls for outbound API responses."""
+        if not isinstance(tool_calls, list):
+            return None
+
+        normalized: List[Dict[str, Any]] = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+
+            tool_id = tool_call.get("id")
+            if not isinstance(tool_id, str) or not tool_id.strip():
+                continue
+
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+
+            arguments = function.get("arguments", "{}")
+            if isinstance(arguments, dict):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            elif not isinstance(arguments, str):
+                arguments = str(arguments)
+
+            normalized.append(
+                {
+                    "id": tool_id.strip(),
+                    "type": "function",
+                    "function": {
+                        "name": name.strip(),
+                        "arguments": arguments,
+                    },
+                }
+            )
+
+        return normalized or None
+
     def _normalize_codex_passthrough_body(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize Codex-style /v1/responses requests for strict preflight.
 
@@ -651,11 +692,13 @@ class APIServerAdapter(BasePlatformAdapter):
         runtime: Dict[str, Any],
         stream: bool,
         stream_delta_callback=None,
+        stream_tool_call_delta_callback=None,
     ) -> tuple[Dict[str, Any], Dict[str, int]]:
         mapped_model = self._normalize_passthrough_model(body.get("model"), runtime.get("model", ""))
         agent = self._create_agent(
             session_id=f"api-passthrough-{uuid.uuid4().hex[:12]}",
             stream_delta_callback=stream_delta_callback,
+            stream_tool_call_delta_callback=stream_tool_call_delta_callback,
         )
         result = agent.run_single_provider_call(
             endpoint="chat_completions",
@@ -667,6 +710,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return {
             "final_response": result.get("final_response", ""),
             "finish_reason": result.get("finish_reason", "stop"),
+            "tool_calls": result.get("tool_calls"),
             "model": result.get("model") or mapped_model or str(runtime.get("model") or self._model_name),
         }, usage
 
@@ -677,6 +721,7 @@ class APIServerAdapter(BasePlatformAdapter):
         runtime: Dict[str, Any],
         stream: bool,
         stream_delta_callback=None,
+        stream_tool_call_delta_callback=None,
     ) -> tuple[Dict[str, Any], Dict[str, int]]:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
@@ -686,6 +731,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 runtime=runtime,
                 stream=stream,
                 stream_delta_callback=stream_delta_callback,
+                stream_tool_call_delta_callback=stream_tool_call_delta_callback,
             ),
         )
 
@@ -745,12 +791,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
+            def _on_tool_call_delta(delta):
+                if delta:
+                    _stream_q.put(("__tool_call_delta__", delta))
+
             task = asyncio.ensure_future(
                 self._provider_client_call_chat(
                     body=body,
                     runtime=runtime,
                     stream=True,
                     stream_delta_callback=_on_delta,
+                    stream_tool_call_delta_callback=_on_tool_call_delta,
                 )
             )
             return await self._write_sse_chat_completion(
@@ -761,6 +812,8 @@ class APIServerAdapter(BasePlatformAdapter):
             result, usage = await self._provider_client_call_chat(
                 body=body, runtime=runtime, stream=False,
             )
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc)), status=400)
         except Exception as exc:
             logger.error("Provider-client passthrough chat failed: %s", exc, exc_info=True)
             return web.json_response(
@@ -786,6 +839,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+
+        output_tool_calls = self._chat_completion_output_tool_calls(result.get("tool_calls"))
+        if output_tool_calls:
+            message = response_data["choices"][0]["message"]
+            if not message.get("content"):
+                message["content"] = None
+            message["tool_calls"] = output_tool_calls
+            response_data["choices"][0]["finish_reason"] = result.get("finish_reason") or "tool_calls"
+
         return web.json_response(response_data)
 
     async def _maybe_passthrough_responses(
@@ -865,6 +927,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        stream_tool_call_delta_callback=None,
         tool_progress_callback=None,
     ) -> Any:
         """
@@ -903,6 +966,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
+            stream_tool_call_delta_callback=stream_tool_call_delta_callback,
             tool_progress_callback=tool_progress_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
@@ -1222,6 +1286,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_call_delta__":
+                    content_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"tool_calls": [item[1]]},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -1260,9 +1337,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            finish_reason = "stop"
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+                finish_reason = result.get("finish_reason", "stop") if isinstance(result, dict) else "stop"
             except Exception:
                 pass
 
@@ -1270,7 +1349,7 @@ class APIServerAdapter(BasePlatformAdapter):
             finish_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
                 "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                 "usage": {
                     "prompt_tokens": usage.get("input_tokens", 0),
                     "completion_tokens": usage.get("output_tokens", 0),

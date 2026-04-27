@@ -549,6 +549,7 @@ class AIAgent:
         clarify_callback: callable = None,
         step_callback: callable = None,
         stream_delta_callback: callable = None,
+        stream_tool_call_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
         tool_gen_callback: callable = None,
         status_callback: callable = None,
@@ -699,6 +700,7 @@ class AIAgent:
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
         self.stream_delta_callback = stream_delta_callback
+        self.stream_tool_call_delta_callback = stream_tool_call_delta_callback
         self.interim_assistant_callback = interim_assistant_callback
         self.status_callback = status_callback
         self.tool_gen_callback = tool_gen_callback
@@ -4038,6 +4040,100 @@ class AIAgent:
             messages.append(msg)
         return messages
 
+    @staticmethod
+    def _single_call_has_body_key(body: Dict[str, Any], key: str) -> bool:
+        return isinstance(body, dict) and key in body
+
+    def _single_call_normalize_chat_tools(self, raw_tools: Any) -> Optional[List[Dict[str, Any]]]:
+        """Normalize OpenAI chat-completions tools into Responses tool schemas."""
+        if raw_tools is None:
+            return None
+        if not isinstance(raw_tools, list):
+            raise ValueError("Chat Completions request 'tools' must be a list when provided.")
+        if not raw_tools:
+            return []
+
+        converted: List[Dict[str, Any]] = []
+        for idx, item in enumerate(raw_tools):
+            if not isinstance(item, dict):
+                raise ValueError(f"Chat Completions tools[{idx}] must be an object.")
+            if item.get("type") != "function":
+                raise ValueError(f"Chat Completions tools[{idx}] has unsupported type {item.get('type')!r}.")
+
+            fn = item.get("function")
+            if not isinstance(fn, dict):
+                raise ValueError(f"Chat Completions tools[{idx}] is missing a valid function object.")
+
+            name = fn.get("name")
+            parameters = fn.get("parameters")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"Chat Completions tools[{idx}] is missing a valid function name.")
+            if not isinstance(parameters, dict):
+                raise ValueError(f"Chat Completions tools[{idx}] is missing valid function parameters.")
+
+            description = fn.get("description", "")
+            if description is None:
+                description = ""
+            if not isinstance(description, str):
+                description = str(description)
+
+            converted.append(
+                {
+                    "type": "function",
+                    "name": name.strip(),
+                    "description": description,
+                    "strict": False,
+                    "parameters": parameters,
+                }
+            )
+        return converted
+
+    def _single_call_build_codex_chat_api_kwargs(
+        self, body: Dict[str, Any], api_messages: List[Dict[str, Any]], *, stream: bool,
+    ) -> Dict[str, Any]:
+        """Build Codex Responses kwargs for chat-completions passthrough."""
+        api_kwargs = self._build_api_kwargs(api_messages)
+
+        if self._single_call_has_body_key(body, "tools"):
+            api_kwargs["tools"] = self._single_call_normalize_chat_tools(body.get("tools"))
+        else:
+            api_kwargs.pop("tools", None)
+
+        if self._single_call_has_body_key(body, "tool_choice"):
+            api_kwargs["tool_choice"] = body.get("tool_choice")
+        else:
+            api_kwargs.pop("tool_choice", None)
+
+        if self._single_call_has_body_key(body, "parallel_tool_calls"):
+            api_kwargs["parallel_tool_calls"] = body.get("parallel_tool_calls")
+        else:
+            api_kwargs.pop("parallel_tool_calls", None)
+
+        if self._single_call_has_body_key(body, "max_tokens"):
+            max_tokens = body.get("max_tokens")
+            if max_tokens is None:
+                api_kwargs.pop("max_output_tokens", None)
+            elif isinstance(max_tokens, (int, float)) and max_tokens > 0:
+                api_kwargs["max_output_tokens"] = int(max_tokens)
+            else:
+                raise ValueError("Chat Completions request 'max_tokens' must be a positive number when provided.")
+
+        if self._single_call_has_body_key(body, "temperature"):
+            temperature = body.get("temperature")
+            if temperature is None:
+                api_kwargs.pop("temperature", None)
+            elif isinstance(temperature, (int, float)):
+                api_kwargs["temperature"] = float(temperature)
+            else:
+                raise ValueError("Chat Completions request 'temperature' must be a number when provided.")
+
+        if self._single_call_has_body_key(body, "stop"):
+            stop = body.get("stop")
+            if stop not in (None, "", []):
+                raise ValueError("Chat Completions request 'stop' is not supported for codex_responses passthrough.")
+
+        return self._preflight_codex_api_kwargs(api_kwargs, allow_stream=stream)
+
     def _single_call_responses_to_chat_messages(self, body: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Convert Responses API request body to chat-style messages."""
         messages: List[Dict[str, Any]] = []
@@ -4176,9 +4272,14 @@ class AIAgent:
 
             if endpoint == "chat_completions":
                 api_messages = self._single_call_normalize_chat_messages(body.get("messages"))
-                api_kwargs = self._build_api_kwargs(api_messages)
                 if self.api_mode == "codex_responses":
-                    api_kwargs = self._preflight_codex_api_kwargs(api_kwargs, allow_stream=stream)
+                    api_kwargs = self._single_call_build_codex_chat_api_kwargs(
+                        body,
+                        api_messages,
+                        stream=stream,
+                    )
+                else:
+                    api_kwargs = self._build_api_kwargs(api_messages)
                 response = (
                     self._interruptible_streaming_api_call(api_kwargs)
                     if stream
@@ -4187,9 +4288,16 @@ class AIAgent:
                 assistant_message, finish_reason = self._single_call_extract_assistant(response)
                 final_text = getattr(assistant_message, "content", "") or ""
                 usage = self._single_call_usage(response)
+                normalized_tool_calls = None
+                if getattr(assistant_message, "tool_calls", None):
+                    normalized_tool_calls = self._build_assistant_message(
+                        assistant_message,
+                        finish_reason or "stop",
+                    ).get("tool_calls")
                 return {
                     "final_response": final_text,
                     "finish_reason": finish_reason or "stop",
+                    "tool_calls": normalized_tool_calls,
                     "model": self.model,
                     "usage": usage,
                 }
@@ -4566,6 +4674,34 @@ class AIAgent:
                             done_item = getattr(event, "item", None)
                             if done_item is not None:
                                 collected_output_items.append(done_item)
+                                done_type = getattr(done_item, "type", None)
+                                if done_type in {"function_call", "custom_tool_call"}:
+                                    fn_name = getattr(done_item, "name", "") or ""
+                                    arguments = (
+                                        getattr(done_item, "arguments", None)
+                                        if done_type == "function_call"
+                                        else getattr(done_item, "input", None)
+                                    )
+                                    if not isinstance(arguments, str):
+                                        arguments = json.dumps(arguments or {}, ensure_ascii=False)
+                                    call_id = getattr(done_item, "call_id", None)
+                                    if not isinstance(call_id, str) or not call_id.strip():
+                                        raw_id = getattr(done_item, "id", None)
+                                        embedded_call_id, _ = self._split_responses_tool_id(raw_id)
+                                        call_id = embedded_call_id
+                                    if not isinstance(call_id, str) or not call_id.strip():
+                                        call_id = self._deterministic_call_id(fn_name, arguments, 0)
+                                    self._fire_stream_tool_call_delta(
+                                        {
+                                            "index": 0,
+                                            "id": call_id.strip(),
+                                            "type": "function",
+                                            "function": {
+                                                "name": fn_name,
+                                                "arguments": arguments,
+                                            },
+                                        }
+                                    )
                         # Log non-completed terminal events for diagnostics
                         elif event_type in ("response.incomplete", "response.failed"):
                             resp_obj = getattr(event, "response", None)
@@ -5086,6 +5222,15 @@ class AIAgent:
             except Exception:
                 pass
 
+    def _fire_stream_tool_call_delta(self, tool_call_delta: Dict[str, Any]) -> None:
+        """Fire streamed tool call deltas for API adapters that need them."""
+        cb = getattr(self, "stream_tool_call_delta_callback", None)
+        if cb is not None:
+            try:
+                cb(tool_call_delta)
+            except Exception:
+                pass
+
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.
 
@@ -5306,6 +5451,20 @@ class AIAgent:
                             if hasattr(extra, "model_dump"):
                                 extra = extra.model_dump()
                             entry["extra_content"] = extra
+                        tc_payload = {
+                            "index": idx,
+                            "id": tc_delta.id or None,
+                            "type": "function",
+                            "function": {},
+                        }
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tc_payload["function"]["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tc_payload["function"]["arguments"] = tc_delta.function.arguments
+                        if extra is not None:
+                            tc_payload["extra_content"] = extra
+                        self._fire_stream_tool_call_delta(tc_payload)
                         # Fire once per tool when the full name is available
                         name = entry["function"]["name"]
                         if name and idx not in tool_gen_notified:
